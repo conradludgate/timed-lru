@@ -1,7 +1,7 @@
 use std::{
     collections::hash_map::RandomState,
-    hash::{BuildHasher, Hash, Hasher},
-    time::Instant,
+    fmt::Debug,
+    hash::{BuildHasher, Hash},
 };
 
 use hashbrown::{
@@ -9,79 +9,54 @@ use hashbrown::{
     Equivalent,
 };
 
-// struct TtlMap<K, V> {
-//     hasher: RandomState,
-//     // stored indices to data, hashed by K
-//     map: RawTable<usize>,
-//     // key, value, heap_position
-//     data: Vec<(K, V, usize)>,
-//     // min heap by instant, usize in the index into the data
-//     heap: Vec<(Instant, usize)>,
-// }
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct DataIndex {
+    data: usize,
+}
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct HeapIndex {
+    heap: usize,
+}
 
-// impl<K: Hash, V> TtlMap<K, V> {
-//     // find the entry that is next to expire
-//     fn peek_front(&self, now: Instant) -> Option<usize> {
-//         let (time, space) = *self.heap.first()?;
-//         (time < now).then_some(space)
-//     }
-
-//     // evict expired entries
-//     fn evict(&mut self, now: Instant) {
-//         while let Some(expired) = self.peek_front(now) {
-//             let _ = self.heap.swap_remove(0);
-
-//             // remove data from map
-//             {
-//                 let (key, _, _expired) = self.data.swap_remove(expired);
-//                 debug_assert_eq!(expired, _expired);
-
-//                 let hash = {
-//                     let mut hasher = self.hasher.build_hasher();
-//                     key.hash(&mut hasher);
-//                     hasher.finish()
-//                 };
-//                 self.map.remove_entry(hash, |&idx| idx == expired).unwrap();
-//             }
-
-//             // update data -> heap relationship
-//             if let Some(&(_, x)) = self.heap.first() {
-//                 self.data[x].2 = 0;
-//             }
-
-//             // update heap -> data relationship
-//             if let Some(&(ref k, _, heap_pos)) = self.data.get(expired) {
-//                 let hash = {
-//                     let mut hasher = self.hasher.build_hasher();
-//                     k.hash(&mut hasher);
-//                     hasher.finish()
-//                 };
-//                 // find the entry that was pointing to the end we swapped, then update it
-//                 *self
-//                     .map
-//                     .get_mut(hash, |&idx| idx == self.data.len())
-//                     .unwrap() = expired;
-
-//                 // make sure the corresponding heap entry points to the right place
-//                 debug_assert_eq!(self.heap[heap_pos].1, self.data.len());
-//                 self.heap[heap_pos].1 = expired;
-//             }
-
-//             //
-//         }
-//     }
-// }
-
-pub struct TtlMap2<K, V, T> {
+pub struct TtlMap<K, V, T> {
     hasher: RandomState,
     // stored indices to heap, hashed by K
-    map: RawTable<usize>,
+    map: RawTable<DataIndex>,
+
+    data: Vec<(K, V, HeapIndex)>,
+
     // min heap by instant
-    heap: Vec<(T, K, V)>,
+    heap: Vec<(T, DataIndex)>,
     capacity: usize,
 }
 
-impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
+impl<K: core::fmt::Debug, V: core::fmt::Debug, T: core::fmt::Debug> core::fmt::Debug
+    for TtlMap<K, V, T>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        struct Map<'a> {
+            map: &'a RawTable<DataIndex>,
+        }
+
+        impl core::fmt::Debug for Map<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_list()
+                    .entries(unsafe { self.map.iter().map(|i| i.as_ref()) })
+                    .finish()
+            }
+        }
+
+        f.debug_struct("TtlMap2")
+            .field("hasher", &self.hasher)
+            .field("map", &Map { map: &self.map })
+            .field("data", &self.data)
+            .field("heap", &self.heap)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap<K, V, T> {
     // // find the entry that is next to expire
     // fn peek_front(&self, now: Instant) -> Option<usize> {
     //     let (time, space) = *self.heap.first()?;
@@ -89,9 +64,10 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
     // }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        TtlMap2 {
+        TtlMap {
             hasher: RandomState::new(),
             map: RawTable::with_capacity(capacity),
+            data: Vec::with_capacity(capacity),
             heap: Vec::with_capacity(capacity),
             capacity,
         }
@@ -118,7 +94,7 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
     /// evicts a single expired entry from the map.
     /// will re-position elements in the map
     fn evict1(&mut self, now: T) -> bool {
-        let Some(&(expires, _, _)) = self.heap.first() else {
+        let Some(&(expires, _)) = self.heap.first() else {
             return false;
         };
 
@@ -126,41 +102,66 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
             return false;
         }
 
-        let (_, key, _) = self.heap.swap_remove(0);
+        let heap_evicted = HeapIndex { heap: 0 };
+        let (_, data_evicted) = self.heap.swap_remove(heap_evicted.heap);
+        // fix data -> heap
+        if let Some(&(_, data_idx)) = self.heap.get(heap_evicted.heap) {
+            let _old_heap_idx = std::mem::replace(&mut self.data[data_idx.data].2, heap_evicted);
+            debug_assert_eq!(_old_heap_idx.heap, self.heap.len());
+        }
+
+        let (key, _, _evicted) = self.data.swap_remove(data_evicted.data);
+        debug_assert_eq!(_evicted.heap, 0);
 
         // remove data from map
         let hash = self.hasher.hash_one(&key);
-        self.map.remove_entry(hash, |&idx| idx == 0).unwrap();
+        self.map
+            .remove_entry(hash, |&idx| idx.data == data_evicted.data)
+            .unwrap();
+
+        if let Some(&(ref key, _, heap_idx)) = self.data.get(data_evicted.data) {
+            // fix map -> data
+            let hash = self.hasher.hash_one(key);
+            *self
+                .map
+                .get_mut(hash, |&idx| idx.data == self.data.len())
+                .unwrap() = data_evicted;
+
+            // fix heap -> data
+            let _old_data_idx = std::mem::replace(&mut self.heap[heap_idx.heap].1, data_evicted);
+            debug_assert_eq!(_old_data_idx.data, self.data.len());
+        }
 
         if self.heap.is_empty() {
             return false;
         }
 
         // push down the entry we swapped
-        let i = self.downheap(self.heap[0].0, 0);
+        let heap_idx = self.downheap(self.heap[0].0, HeapIndex { heap: 0 });
 
-        // find the entry that was pointing to the end we swapped, then update it
-        let hash = self.hasher.hash_one(&self.heap[i].1);
-        *self
-            .map
-            .get_mut(hash, |&idx| idx == self.heap.len())
-            .unwrap() = i;
+        // fix data -> heap
+        let data_idx = self.heap[heap_idx.heap].1;
+        self.data[data_idx.data].2 = heap_idx;
 
         true
     }
 
     /// move a new element that has a larger TTL down the heap
     /// will not re-position elements in the map
-    fn downheap(&mut self, expires: T, mut i: usize) -> usize {
+    fn downheap(&mut self, expires: T, mut i: HeapIndex) -> HeapIndex {
         loop {
-            let left = 2 * (i + 1) - 1;
-            let right = 2 * (i + 1) + 1 - 1;
+            let left = HeapIndex {
+                heap: 2 * i.heap + 1,
+            };
+            let right = HeapIndex {
+                heap: 2 * i.heap + 2,
+            };
 
             let mut largest = i;
-            if left < self.heap.len() && self.heap[left].0 < expires {
+            if left.heap < self.heap.len() && self.heap[left.heap].0 < expires {
                 largest = left
             }
-            if right < self.heap.len() && self.heap[right].0 < expires {
+            if right.heap < self.heap.len() && self.heap[right.heap].0 < expires {
                 largest = right
             }
 
@@ -168,29 +169,31 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
                 break i;
             }
 
-            let hash = self.hasher.hash_one(&self.heap[largest].1);
-            *self.map.get_mut(hash, |&idx| idx == largest).unwrap() = i;
-            self.heap.swap(i, largest);
+            let data_idx = self.heap[largest.heap].1;
+            self.data[data_idx.data].2 = i;
 
+            self.heap.swap(i.heap, largest.heap);
             i = largest;
         }
     }
 
     /// move a new element that has a shorter TTL up the heap.
     /// will not re-position elements in the map
-    fn upheap(&mut self, expires: T, mut i: usize) -> usize {
-        while i > 0 {
-            let parent = (i - 1) / 2;
+    fn upheap(&mut self, expires: T, mut i: HeapIndex) -> HeapIndex {
+        while i.heap > 0 {
+            let parent = HeapIndex {
+                heap: (i.heap - 1) / 2,
+            };
 
             // check if we need to continue
-            if expires > self.heap[parent].0 {
+            if expires > self.heap[parent.heap].0 {
                 break;
             }
 
-            let hash = self.hasher.hash_one(&self.heap[parent].1);
-            *self.map.get_mut(hash, |&idx| idx == parent).unwrap() = i;
-            self.heap.swap(parent, i);
+            let data_idx = self.heap[parent.heap].1;
+            self.data[data_idx.data].2 = i;
 
+            self.heap.swap(i.heap, parent.heap);
             i = parent;
         }
         i
@@ -200,7 +203,7 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
         let hash = self.hasher.hash_one(&key);
 
         let slot = if self.heap.len() >= self.capacity {
-            match self.map.find(hash, |&idx| self.heap[idx].1 == key) {
+            match self.map.find(hash, |&idx| self.data[idx.data].0 == key) {
                 // we are at capacity but we will replace an existing entry
                 Some(bucket) => Ok(bucket),
                 // we will overflow capacity. evict
@@ -212,48 +215,62 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
                     // see insert_slot_no_grow below
                     self.map.find_or_find_insert_slot(
                         hash,
-                        |&idx| self.heap[idx].1 == key,
-                        |&idx| self.hasher.hash_one(&self.heap[idx].1),
+                        |&idx| self.data[idx.data].0 == key,
+                        |&idx| self.hasher.hash_one(&self.data[idx.data].0),
                     )
                 }
             }
         } else {
             self.map.find_or_find_insert_slot(
                 hash,
-                |&idx| self.heap[idx].1 == key,
-                |&idx| self.hasher.hash_one(&self.heap[idx].1),
+                |&idx| self.data[idx.data].0 == key,
+                |&idx| self.hasher.hash_one(&self.data[idx.data].0),
             )
         };
 
         match slot {
             Ok(bucket) => {
                 // SAFETY: we haven't updated the hashtable so this bucket still points to the correct place
-                let (i, slot) = unsafe { self.map.remove(bucket) };
-                let (would_expire, _key, value) =
-                    std::mem::replace(&mut self.heap[i], (expires, key, value));
+                let data_idx = unsafe { *bucket.as_ref() };
 
-                if expires >= would_expire {
-                    let i = self.downheap(expires, i);
+                self.data[data_idx.data].0 = key;
+                let old_value = std::mem::replace(&mut self.data[data_idx.data].1, value);
+                let heap_idx = self.data[data_idx.data].2;
+                let would_expire = self.heap[heap_idx.heap].0;
 
-                    // SAFETY: we haven't updated the hashtable positions so this slot still points to the correct place
-                    unsafe { self.map.insert_in_slot(hash, slot, i) };
-                    Some(value)
+                let heap_idx = if expires >= would_expire {
+                    self.downheap(expires, heap_idx)
                 } else {
-                    let i = self.upheap(expires, i);
+                    self.upheap(expires, heap_idx)
+                };
 
-                    // SAFETY: we haven't updated the hashtable positions so this slot still points to the correct place
-                    unsafe { self.map.insert_in_slot(hash, slot, i) };
-                    Some(value)
-                }
+                // fix data -> heap
+                let data_idx = self.heap[heap_idx.heap].1;
+                self.data[data_idx.data].2 = heap_idx;
+
+                Some(old_value)
             }
             Err(slot) => {
-                let i = self.heap.len();
+                let heap_idx = HeapIndex {
+                    heap: self.heap.len(),
+                };
+                let data_idx = DataIndex {
+                    data: self.data.len(),
+                };
+
                 // TODO: push_within_capacity?
-                self.heap.push((expires, key, value));
-                let i = self.upheap(expires, i);
+                self.heap.push((expires, data_idx));
+                self.data.push((key, value, heap_idx));
 
                 // SAFETY: we haven't updated the hashtable positions so this slot still points to the correct place
-                unsafe { self.map.insert_in_slot(hash, slot, i) };
+                unsafe { self.map.insert_in_slot(hash, slot, data_idx) };
+
+                let heap_idx = self.upheap(expires, heap_idx);
+
+                // fix data -> heap
+                let data_idx = self.heap[heap_idx.heap].1;
+                self.data[data_idx.data].2 = heap_idx;
+
                 None
             }
         }
@@ -264,10 +281,12 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
         Q: Hash + Equivalent<K> + ?Sized,
     {
         let hash = self.hasher.hash_one(key);
-        let index = self
+        let data_idx = *self
             .map
-            .get(hash, |&idx| key.equivalent(&self.heap[idx].1))?;
-        let &(ttl, _, ref value) = self.heap.get(*index).unwrap();
+            .get(hash, |&idx| key.equivalent(&self.data[idx.data].0))?;
+        let &(_, ref value, heap_idx) = self.data.get(data_idx.data).unwrap();
+        let &(ttl, _data_idx) = self.heap.get(heap_idx.heap).unwrap();
+        debug_assert_eq!(data_idx, _data_idx);
         Some((ttl, value))
     }
 
@@ -296,11 +315,11 @@ impl<K: Hash + Eq, V, T: Ord + Copy> TtlMap2<K, V, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::TtlMap2;
+    use crate::TtlMap;
 
     #[test]
     fn can_expire() {
-        let mut map = TtlMap2::with_capacity(4);
+        let mut map = TtlMap::with_capacity(4);
 
         let now = 0;
         let later = 1;
